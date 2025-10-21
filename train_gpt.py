@@ -23,13 +23,18 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
-@torch.library.custom_op("nanogpt::mm", mutates_args=())
+@torch.library.custom_op("nanogpt::mm", mutates_args=()) # -> call it with torch.ops.nanogpt.mm(x, w, x_s, w_s, grad_s)
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    # x_s and w_s are the scaling factors for x and w. 
+    # fp8 has smalll ranges, so we scale the inputs down before casting to fp8.
     @torch.compile
     def impl(x: Tensor, w: Tensor):
         assert x.is_contiguous() and w.is_contiguous()
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+        # Inputs stored/loaded as FP8 for bandwidth and cache efficiency; FP8 halves bandwidth vs FP16 and can significantly speed up GEMMs on Hopper-class GPUs
+        # Internal accumulation in a higher precision (bfloat16) for better numerical stability
+        # GPU loads blocks (“tiles”) of x_f8 and w_f8 from HBM → L2 → Shared Memory (SMEM).
         out = torch._scaled_mm(
             x_f8,
             w_f8.T,
@@ -38,6 +43,7 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
             scale_b=x.new_tensor(w_s, dtype=torch.float32),
             use_fast_accum=True,
         )
+        # Fused correctness: Avoids manual dequantize→matmul→rescale steps; the kernel handles scaling consistently and efficiently.
         return out, x_f8, w_f8
 
     return impl(x, w)
@@ -90,14 +96,18 @@ def backward(ctx, grad_out: Tensor, *_):
     grad_x, grad_w = torch.ops.nanogpt.mm_backward(
         grad_out, x_f8, w_f8, x_s, w_s, grad_s
     )
-    return grad_x, grad_w, None, None, None
+    return grad_x, grad_w, None, None, None 
+    # None for non-differentiable args
 
 def setup_context(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+    # setup_context runs right after forward
+
     *_, x_s, w_s, grad_s = inputs
     _, x_f8, w_f8 = output
     ctx.save_for_backward(x_f8, w_f8)
     ctx.scales = x_s, w_s, grad_s
-    ctx.set_materialize_grads(False)
+    ctx.set_materialize_grads(False) 
+    #  avoid auto-allocating zero grads for non-differentiable args.
 
 mm_op.register_autograd(backward, setup_context=setup_context)
 
@@ -512,6 +522,7 @@ def _load_data_shard(file: Path):
 
 # find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap
 def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
+    print(f"[DEBUG] Finding batch starts in span {max_batch_span} from pos {pos} with local batch size {local_batch_size}")
     boundary_mask = tokens[pos : pos + max_batch_span] == 50256
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
     start = boundary_positions[0].item()
